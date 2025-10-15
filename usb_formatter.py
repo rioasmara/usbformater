@@ -16,19 +16,223 @@ import win32file
 import win32con
 import ctypes
 import wmi
+from win32api import GetVolumeInformation
+from win32file import GetDriveType
+import win32com.client
 
 
 class USBMonitor(QObject):
-    """Monitor for USB device changes"""
+    """Monitor for USB device changes including USB and portable SCSI drives"""
     usb_connected = pyqtSignal(str)  # Signal emitted when USB is connected
     usb_disconnected = pyqtSignal(str)  # Signal emitted when USB is disconnected
 
     def __init__(self):
         super().__init__()
+        self.wmi_client = wmi.WMI()
         self.previous_drives = set(self.get_removable_drives())
 
-    def get_removable_drives(self):
-        """Get list of removable drives (USB drives)"""
+    def is_external_drive(self, drive_letter, debug=False):
+        """Check if drive is external (USB or portable SCSI with surprise removal policy)"""
+        try:
+            for physical_disk in self.wmi_client.Win32_DiskDrive():
+                for partition in physical_disk.associators("Win32_DiskDriveToDiskPartition"):
+                    for logical_disk in partition.associators("Win32_LogicalDiskToPartition"):
+                        if logical_disk.DeviceID == f"{drive_letter}:":
+                            interface_type = physical_disk.InterfaceType or ""
+                            pnp_id = physical_disk.PNPDeviceID or ""
+                            media_type = physical_disk.MediaType or ""
+
+                            if debug:
+                                print(f"[DEBUG] Drive {drive_letter}: InterfaceType='{interface_type}'")
+                                print(f"[DEBUG] Drive {drive_letter}: PNP_ID='{pnp_id}'")
+                                print(f"[DEBUG] Drive {drive_letter}: MediaType='{media_type}'")
+
+                            # Check if USB is anywhere in the device tree/parent devices
+                            is_usb_device = self.check_if_usb_in_device_tree(pnp_id, debug)
+                            if is_usb_device:
+                                if debug:
+                                    print(f"[DEBUG] Drive {drive_letter}: Found USB in device tree - ACCEPTED")
+                                return True
+
+                            # Direct USB interface check
+                            if "USB" in interface_type.upper() or "USB" in pnp_id.upper() or "USBSTOR" in pnp_id.upper():
+                                if debug:
+                                    print(f"[DEBUG] Drive {drive_letter}: Detected as USB device - ACCEPTED")
+                                return True
+
+                            # Check for removable or external media type
+                            if "REMOVABLE" in media_type.upper():
+                                if debug:
+                                    print(f"[DEBUG] Drive {drive_letter}: Has REMOVABLE media type - ACCEPTED")
+                                return True
+
+                            # Check for external media type (USB drives often report as "External hard disk media")
+                            if "EXTERNAL" in media_type.upper():
+                                if debug:
+                                    print(f"[DEBUG] Drive {drive_letter}: Has EXTERNAL media type - ACCEPTED")
+                                return True
+
+                            # For SCSI, check if it has surprise removal policy (portable)
+                            if "SCSI" in interface_type.upper():
+                                if debug:
+                                    print(f"[DEBUG] Drive {drive_letter}: Detected as SCSI, checking removal policy...")
+                                if self.is_portable_scsi(pnp_id, debug):
+                                    if debug:
+                                        print(f"[DEBUG] Drive {drive_letter}: SCSI device has surprise removal policy - ACCEPTED")
+                                    return True
+                                else:
+                                    if debug:
+                                        print(f"[DEBUG] Drive {drive_letter}: SCSI device does NOT have surprise removal policy - REJECTED")
+                                    return False
+
+                            if debug:
+                                print(f"[DEBUG] Drive {drive_letter}: Not recognized as external drive - REJECTED")
+                            return False
+
+            if debug:
+                print(f"[DEBUG] Drive {drive_letter}: No WMI disk information found")
+            return False
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Error checking drive {drive_letter}: {e}")
+            return False
+
+    def check_if_usb_in_device_tree(self, pnp_device_id, debug=False):
+        """Check if USB appears anywhere in the device's parent tree"""
+        try:
+            import win32com.client
+            wmi_obj = win32com.client.GetObject("winmgmts:")
+
+            # Query for the device
+            query = f"SELECT * FROM Win32_PnPEntity WHERE DeviceID = '{pnp_device_id.replace(chr(92), chr(92)+chr(92))}'"
+            devices = wmi_obj.ExecQuery(query)
+
+            for device in devices:
+                # Check parent devices
+                try:
+                    parent_id = device.Properties_("PNPDeviceID").Value
+                    if parent_id and ("USB" in parent_id.upper() or "USBSTOR" in parent_id.upper()):
+                        if debug:
+                            print(f"[DEBUG] Found USB in device PNP ID: {parent_id}")
+                        return True
+                except:
+                    pass
+
+            return False
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Error checking device tree: {e}")
+            return False
+
+    def is_portable_scsi(self, pnp_device_id, debug=False):
+        """Check if SCSI device has CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL policy"""
+        try:
+            if debug:
+                print(f"[DEBUG] Checking removal policy for: {pnp_device_id}")
+            # CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL = 3
+            CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL = 3
+            SPDRP_REMOVAL_POLICY = 0x0000001F  # Device removal policy property
+
+            # Use SetupAPI to query device properties
+            setupapi = ctypes.windll.setupapi
+
+            # Get device info set
+            DIGCF_PRESENT = 0x00000002
+            DIGCF_ALLCLASSES = 0x00000004
+
+            class SP_DEVINFO_DATA(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_ulong),
+                    ("ClassGuid", ctypes.c_byte * 16),
+                    ("DevInst", ctypes.c_ulong),
+                    ("Reserved", ctypes.c_void_p)
+                ]
+
+            h_dev_info = setupapi.SetupDiGetClassDevsW(
+                None,
+                None,
+                None,
+                DIGCF_PRESENT | DIGCF_ALLCLASSES
+            )
+
+            if h_dev_info == -1:
+                return False
+
+            try:
+                dev_info_data = SP_DEVINFO_DATA()
+                dev_info_data.cbSize = ctypes.sizeof(SP_DEVINFO_DATA)
+
+                index = 0
+                while setupapi.SetupDiEnumDeviceInfo(h_dev_info, index, ctypes.byref(dev_info_data)):
+                    index += 1
+
+                    # Get device instance ID
+                    buffer_size = ctypes.c_ulong(0)
+                    setupapi.SetupDiGetDeviceInstanceIdW(
+                        h_dev_info,
+                        ctypes.byref(dev_info_data),
+                        None,
+                        0,
+                        ctypes.byref(buffer_size)
+                    )
+
+                    if buffer_size.value == 0:
+                        continue
+
+                    instance_id = ctypes.create_unicode_buffer(buffer_size.value)
+                    if not setupapi.SetupDiGetDeviceInstanceIdW(
+                        h_dev_info,
+                        ctypes.byref(dev_info_data),
+                        instance_id,
+                        buffer_size,
+                        None
+                    ):
+                        continue
+
+                    # Check if this is our device
+                    if pnp_device_id.upper() in instance_id.value.upper():
+                        if debug:
+                            print(f"[DEBUG] Found matching device: {instance_id.value}")
+
+                        # Get removal policy
+                        removal_policy = ctypes.c_ulong(0)
+                        property_type = ctypes.c_ulong(0)
+
+                        result = setupapi.SetupDiGetDeviceRegistryPropertyW(
+                            h_dev_info,
+                            ctypes.byref(dev_info_data),
+                            SPDRP_REMOVAL_POLICY,
+                            ctypes.byref(property_type),
+                            ctypes.byref(removal_policy),
+                            ctypes.sizeof(removal_policy),
+                            None
+                        )
+
+                        if result:
+                            if debug:
+                                print(f"[DEBUG] Removal policy value: {removal_policy.value} (3=surprise removal)")
+                            # Check if removal policy is CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL
+                            is_surprise_removal = removal_policy.value == CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL
+                            if debug:
+                                print(f"[DEBUG] Is surprise removal policy: {is_surprise_removal}")
+                            return is_surprise_removal
+                        else:
+                            if debug:
+                                print(f"[DEBUG] Could not get removal policy property")
+
+                if debug:
+                    print(f"[DEBUG] Device not found in enumeration")
+                return False
+
+            finally:
+                setupapi.SetupDiDestroyDeviceInfoList(h_dev_info)
+
+        except Exception as e:
+            # If we can't determine, exclude it for safety
+            return False
+
+    def get_removable_drives(self, debug=False):
+        """Get list of removable drives (USB and portable SCSI drives with surprise removal policy)"""
         drives = []
         bitmask = win32api.GetLogicalDrives()
         for letter in string.ascii_uppercase:
@@ -36,12 +240,45 @@ class USBMonitor(QObject):
                 drive_path = f"{letter}:\\"
                 try:
                     drive_type = win32file.GetDriveType(drive_path)
-                    # DRIVE_REMOVABLE = 2
+                    if debug:
+                        print(f"[DEBUG] Drive {letter}: type={drive_type} (2=REMOVABLE, 3=FIXED, 5=CDROM)")
+
+                    # DRIVE_REMOVABLE = 2, DRIVE_FIXED = 3, DRIVE_CDROM = 5
+                    # Always include DRIVE_REMOVABLE (traditional USB flash drives)
                     if drive_type == win32con.DRIVE_REMOVABLE:
-                        drives.append(letter)
-                except:
+                        if debug:
+                            print(f"[DEBUG] Drive {letter}: Is DRIVE_REMOVABLE, checking details...")
+                        # Check if it's actually USB or external
+                        result = self.is_external_drive(letter, debug)
+                        if result:
+                            if debug:
+                                print(f"[DEBUG] Drive {letter}: Confirmed as external, adding to list")
+                            drives.append(letter)
+                        else:
+                            # Even if not confirmed, add DRIVE_REMOVABLE anyway (it's usually USB)
+                            if debug:
+                                print(f"[DEBUG] Drive {letter}: Could not confirm interface but is REMOVABLE, adding anyway")
+                            drives.append(letter)
+                    # Also check fixed drives that might be external (SCSI, USB HDD)
+                    elif drive_type == win32con.DRIVE_FIXED:
+                        if debug:
+                            print(f"[DEBUG] Drive {letter}: Is DRIVE_FIXED, checking if external...")
+                        # Use WMI to verify if it's external
+                        if self.is_external_drive(letter, debug):
+                            if debug:
+                                print(f"[DEBUG] Drive {letter}: Verified as external, adding to list")
+                            drives.append(letter)
+                        else:
+                            if debug:
+                                print(f"[DEBUG] Drive {letter}: Not external, skipping")
+                except Exception as e:
+                    if debug:
+                        print(f"[DEBUG] Drive {letter}: Exception - {e}")
                     pass
             bitmask >>= 1
+
+        if debug:
+            print(f"[DEBUG] Final drives list: {drives}")
         return set(drives)
 
     def check_for_changes(self):
@@ -209,6 +446,13 @@ class USBFormatterWindow(QMainWindow):
         self.auto_format_button.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 10px;")
         self.auto_format_button.clicked.connect(self.toggle_auto_format)
         button_layout.addWidget(self.auto_format_button)
+
+        # Debug button
+        self.debug_button = QPushButton("Debug Scan")
+        self.debug_button.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 10px;")
+        self.debug_button.clicked.connect(self.run_debug_scan)
+        button_layout.addWidget(self.debug_button)
+
         main_layout.addLayout(button_layout)
 
         # Log display
@@ -231,8 +475,9 @@ class USBFormatterWindow(QMainWindow):
         # Now refresh drives after all UI components are created
         self.refresh_drives()
 
-        self.log("Application started. Monitoring for USB devices...")
-        self.log("Multi-threaded support enabled - all USBs will be formatted concurrently!")
+        self.log("Application started. Monitoring for external drives...")
+        self.log("Detecting: USB devices and portable SCSI drives (with surprise removal policy)")
+        self.log("Multi-threaded support enabled - all drives will be formatted concurrently!")
         self.update_drives_table()
 
     def setup_monitoring(self):
@@ -872,6 +1117,29 @@ class USBFormatterWindow(QMainWindow):
         else:
             self.status_label.setText(f"{num_drives} USB drives connected")
             self.status_label.setStyleSheet("color: green; font-weight: bold;")
+
+    def run_debug_scan(self):
+        """Run a debug scan of all drives and log details"""
+        self.log("=" * 50)
+        self.log("DEBUG SCAN: Scanning all drives...")
+        self.log("=" * 50)
+
+        # Redirect stdout to capture debug messages
+        import io
+        from contextlib import redirect_stdout
+
+        debug_output = io.StringIO()
+        with redirect_stdout(debug_output):
+            drives = self.usb_monitor.get_removable_drives(debug=True)
+
+        # Log all debug output
+        for line in debug_output.getvalue().split('\n'):
+            if line.strip():
+                self.log(line)
+
+        self.log("=" * 50)
+        self.log(f"DEBUG SCAN COMPLETE: Found {len(drives)} external drive(s): {sorted(drives)}")
+        self.log("=" * 50)
 
     def log(self, message):
         """Add a message to the log"""
