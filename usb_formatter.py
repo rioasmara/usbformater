@@ -15,6 +15,7 @@ import win32api
 import win32file
 import win32con
 import ctypes
+import wmi
 
 
 class USBMonitor(QObject):
@@ -71,7 +72,9 @@ class USBFormatterWindow(QMainWindow):
         self.drive_status = {}  # Track status of each drive
         self.drive_progress = {}  # Track progress percentage for each drive
         self.drive_sizes = {}  # Track drive sizes in GB
+        self.drive_info = {}  # Track USB product information
         self.active_threads = {}  # Track active formatting threads by drive letter
+        self.wmi_client = wmi.WMI()  # WMI client for hardware info
         self.init_ui()
         self.setup_monitoring()
 
@@ -115,9 +118,30 @@ class USBFormatterWindow(QMainWindow):
         drives_layout = QVBoxLayout()
 
         self.drives_table = QTableWidget()
-        self.drives_table.setColumnCount(5)
-        self.drives_table.setHorizontalHeaderLabels(["Drive", "Label", "Status", "Progress", "Actions"])
-        self.drives_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.drives_table.setColumnCount(6)
+        self.drives_table.setHorizontalHeaderLabels(["Drive", "Label", "Product Info", "Status", "Progress", "Actions"])
+
+        # Make columns resizable by user
+        header = self.drives_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+
+        # Set default column widths
+        self.drives_table.setColumnWidth(0, 60)   # Drive
+        self.drives_table.setColumnWidth(1, 120)  # Label
+        self.drives_table.setColumnWidth(2, 200)  # Product Info
+        self.drives_table.setColumnWidth(3, 120)  # Status
+        self.drives_table.setColumnWidth(4, 150)  # Progress
+        self.drives_table.setColumnWidth(5, 100)  # Actions
+
+        # Allow last section to stretch
+        header.setStretchLastSection(True)
+
+        # Enable word wrap for better text display
+        self.drives_table.setWordWrap(True)
+
+        # Set row height to auto-resize based on content
+        self.drives_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+
         self.drives_table.setMinimumHeight(200)
         drives_layout.addWidget(self.drives_table)
 
@@ -244,13 +268,76 @@ class USBFormatterWindow(QMainWindow):
         except:
             return 0
 
+    def get_usb_product_info(self, drive_letter):
+        """Get USB product information including VID, PID, Serial Number"""
+        try:
+            # Get physical disk associated with the drive letter
+            for physical_disk in self.wmi_client.Win32_DiskDrive():
+                for partition in physical_disk.associators("Win32_DiskDriveToDiskPartition"):
+                    for logical_disk in partition.associators("Win32_LogicalDiskToPartition"):
+                        if logical_disk.DeviceID == f"{drive_letter}:":
+                            # Extract USB information
+                            model = physical_disk.Model or "Unknown"
+                            serial = physical_disk.SerialNumber or "N/A"
+                            interface_type = physical_disk.InterfaceType or "Unknown"
+
+                            # Try to get PNP device ID for VID/PID
+                            pnp_id = physical_disk.PNPDeviceID or ""
+                            vid = "N/A"
+                            pid = "N/A"
+
+                            # Extract VID and PID from PNP Device ID
+                            if "VID_" in pnp_id and "PID_" in pnp_id:
+                                try:
+                                    vid_start = pnp_id.index("VID_") + 4
+                                    vid = pnp_id[vid_start:vid_start + 4]
+                                    pid_start = pnp_id.index("PID_") + 4
+                                    pid = pnp_id[pid_start:pid_start + 4]
+                                except:
+                                    pass
+
+                            return {
+                                'model': model,
+                                'serial': serial,
+                                'vid': vid,
+                                'pid': pid,
+                                'interface': interface_type,
+                                'pnp_id': pnp_id
+                            }
+
+            return {
+                'model': 'Unknown',
+                'serial': 'N/A',
+                'vid': 'N/A',
+                'pid': 'N/A',
+                'interface': 'Unknown',
+                'pnp_id': 'N/A'
+            }
+        except Exception as e:
+            return {
+                'model': 'Error',
+                'serial': 'N/A',
+                'vid': 'N/A',
+                'pid': 'N/A',
+                'interface': 'Unknown',
+                'pnp_id': str(e)
+            }
+
     def on_usb_connected(self, drive_letter):
         """Handle USB connection event"""
         # Get drive size
         size_gb = self.get_drive_size(drive_letter)
         self.drive_sizes[drive_letter] = size_gb
 
+        # Get USB product information
+        product_info = self.get_usb_product_info(drive_letter)
+        self.drive_info[drive_letter] = product_info
+
+        # Log detailed information
         self.log(f"USB Drive detected: {drive_letter}:\\ ({size_gb} GB)")
+        self.log(f"  Model: {product_info['model']}")
+        self.log(f"  VID: {product_info['vid']} | PID: {product_info['pid']}")
+        self.log(f"  Serial: {product_info['serial']}")
 
         # Add to drive status tracking
         self.drive_status[drive_letter] = "Connected"
@@ -439,6 +526,14 @@ class USBFormatterWindow(QMainWindow):
     def format_worker(self, drive_letter, filesystem, secure_erase):
         """Background worker that formats a single drive (runs in its own thread)"""
         try:
+            # Log product information before formatting
+            product_info = self.drive_info.get(drive_letter, {})
+            if product_info:
+                self.log(f"Formatting {drive_letter}:\\ - Product Info:")
+                self.log(f"  VID:PID = {product_info.get('vid', 'N/A')}:{product_info.get('pid', 'N/A')}")
+                self.log(f"  Serial: {product_info.get('serial', 'N/A')}")
+                self.log(f"  Model: {product_info.get('model', 'Unknown')}")
+
             # Perform secure erase if requested
             if secure_erase:
                 self.progress_update.emit(drive_letter, 10, "Starting secure erase...")
@@ -654,6 +749,22 @@ class USBFormatterWindow(QMainWindow):
                 label = "Unknown"
             self.drives_table.setItem(idx, 1, QTableWidgetItem(label))
 
+            # Product Information
+            product_info = self.drive_info.get(drive, {})
+            if product_info:
+                vid = product_info.get('vid', 'N/A')
+                pid = product_info.get('pid', 'N/A')
+                serial = product_info.get('serial', 'N/A')
+                model = product_info.get('model', 'Unknown')
+                product_text = f"VID:{vid} PID:{pid}\nS/N:{serial}\nModel:{model}"
+            else:
+                product_text = "Loading..."
+
+            product_item = QTableWidgetItem(product_text)
+            # Set text alignment and enable wrapping
+            product_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            self.drives_table.setItem(idx, 2, product_item)
+
             # Status
             status = self.drive_status.get(drive, "Connected")
             status_item = QTableWidgetItem(status)
@@ -669,7 +780,7 @@ class USBFormatterWindow(QMainWindow):
             elif status == "Failed":
                 status_item.setBackground(QColor("#FFB6C1"))  # Light red
 
-            self.drives_table.setItem(idx, 2, status_item)
+            self.drives_table.setItem(idx, 3, status_item)
 
             # Progress bar
             progress = self.drive_progress.get(drive, 0)
@@ -728,11 +839,11 @@ class USBFormatterWindow(QMainWindow):
                     }
                 """)
 
-            self.drives_table.setCellWidget(idx, 3, progress_bar)
+            self.drives_table.setCellWidget(idx, 4, progress_bar)
 
             # Action button
             action_text = "Format" if status not in ["Formatting", "Securely Erasing"] else "In Progress"
-            self.drives_table.setItem(idx, 4, QTableWidgetItem(action_text))
+            self.drives_table.setItem(idx, 5, QTableWidgetItem(action_text))
 
     def update_active_status(self):
         """Update the active operations status label"""
